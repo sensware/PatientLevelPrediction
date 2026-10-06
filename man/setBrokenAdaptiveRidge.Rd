@@ -23,7 +23,8 @@ setBrokenAdaptiveRidge(
 }
 \arguments{
 \item{initialRidgeVariance}{Numeric prior starting variance, or \code{"auto"} to
-estimate this using ridge cross-validation.}
+estimate this using ridge cross-validation. The ridge fit applies the same
+\code{noShrinkage} and \code{forceIntercept} settings as the BAR prior.}
 
 \item{seed}{An option to add a seed when training the model.}
 

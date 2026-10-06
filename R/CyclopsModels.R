@@ -654,8 +654,12 @@ resolveCyclopsPriorParams <- function(
     settings) {
   if (!is.null(param$priorParams$initialRidgeVariance) &&
       identical(param$priorParams$initialRidgeVariance, "auto")) {
+    # Shrink the same covariates as the final prior so the selected ridge
+    # variance is not distorted by covariates the user exempted from shrinkage.
     normalPrior <- Cyclops::createPrior(
       priorType = "normal",
+      exclude = param$priorParams$exclude,
+      forceIntercept = isTRUE(param$priorParams$forceIntercept),
       useCrossValidation = max(folds$index) > 1
     )
     normalControl <- Cyclops::createControl(
