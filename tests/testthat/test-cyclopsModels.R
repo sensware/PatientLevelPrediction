@@ -468,6 +468,55 @@ test_that("BAR prior parameters resolve auto values", {
   expect_true(is.finite(param$priorParams$initialRidgeVariance))
 })
 
+test_that("BAR automatic ridge initialization uses the BAR shrinkage settings", {
+  skip_if_not_installed("BrokenAdaptiveRidge")
+  skip_on_cran()
+
+  capturedPriors <- list()
+  testthat::local_mocked_bindings(
+    fitCyclopsModel = function(cyclopsData, prior, control, ...) {
+      capturedPriors[[length(capturedPriors) + 1]] <<- prior
+      list(variance = 0.7)
+    },
+    .package = "Cyclops"
+  )
+  folds <- data.frame(rowId = seq_len(20), index = rep(1:2, 10))
+
+  modelSettings <- setBrokenAdaptiveRidge(
+    noShrinkage = c("(Intercept)", 100),
+    penalty = "bic",
+    seed = 42,
+    threads = 1
+  )
+  param <- resolveCyclopsPriorParams(
+    param = modelSettings$param,
+    cyclopsData = NULL,
+    folds = folds,
+    settings = modelSettings$settings
+  )
+  expect_equal(param$priorParams$initialRidgeVariance, 0.7)
+  expect_equal(capturedPriors[[1]]$priorType, "normal")
+  expect_equal(capturedPriors[[1]]$exclude, c("(Intercept)", 100))
+  expect_false(capturedPriors[[1]]$forceIntercept)
+  expect_true(capturedPriors[[1]]$useCrossValidation)
+
+  modelSettings <- setBrokenAdaptiveRidge(
+    noShrinkage = c(),
+    forceIntercept = TRUE,
+    penalty = "bic",
+    seed = 42,
+    threads = 1
+  )
+  resolveCyclopsPriorParams(
+    param = modelSettings$param,
+    cyclopsData = NULL,
+    folds = folds,
+    settings = modelSettings$settings
+  )
+  expect_null(capturedPriors[[2]]$exclude)
+  expect_true(capturedPriors[[2]]$forceIntercept)
+})
+
 test_that("BAR automatic penalty validates folds before resolving its prior", {
   skip_if_not_installed("BrokenAdaptiveRidge")
   skip_on_cran()

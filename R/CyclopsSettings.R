@@ -386,7 +386,8 @@ setIterativeHardThresholding <- function(
 #' be substantially slower than using a fixed penalty.
 #'
 #' @param initialRidgeVariance Numeric prior starting variance, or `"auto"` to
-#'   estimate this using ridge cross-validation.
+#'   estimate this using ridge cross-validation. The ridge fit applies the same
+#'   `noShrinkage` and `forceIntercept` settings as the BAR prior.
 #' @param seed An option to add a seed when training the model.
 #' @param includeCovariateIds A set of covariateIds to limit the analysis to.
 #' @param noShrinkage A set of covariates which are forced into the model. The
