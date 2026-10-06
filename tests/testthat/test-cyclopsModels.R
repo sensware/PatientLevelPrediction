@@ -671,10 +671,41 @@ test_that("test BAR automatic penalty search runs", {
   expect_type(finalParameters$penalty, "double")
   expect_true(is.finite(finalParameters$penalty))
 
-  cvSearch <- fitModel$trainDetails$hyperParamSearch %>%
-    dplyr::filter(.data$fold == "CV", !is.na(.data$penalty)) %>%
+  hyperParamSearch <- fitModel$trainDetails$hyperParamSearch
+  expect_false(anyNA(hyperParamSearch$penalty))
+  expect_equal(sum(hyperParamSearch$fold == "CV"), 2)
+  cvSearch <- hyperParamSearch %>%
+    dplyr::filter(.data$fold == "CV") %>%
     dplyr::arrange(dplyr::desc(.data$value), dplyr::desc(.data$penalty))
   expect_equal(finalParameters$penalty, cvSearch$penalty[1])
+})
+
+test_that("BAR automatic penalty search reuses tuning fold fits for CV", {
+  skip_if_offline()
+  skip_if_not_installed("BrokenAdaptiveRidge")
+  skip_on_cran()
+
+  testthat::local_mocked_bindings(
+    getCV = function(...) stop("getCV should not refit tuned BAR folds"),
+    .package = "PatientLevelPrediction"
+  )
+  fitModel <- suppressWarnings(
+    fitPlp(
+      trainData = tinyTrainData,
+      modelSettings = setBrokenAdaptiveRidge(
+        penaltyGridSize = 2,
+        seed = 42,
+        threads = 1
+      ),
+      analysisId = "barReuseCvTest",
+      analysisPath = tempdir()
+    )
+  )
+
+  cvPrediction <- fitModel$prediction %>%
+    dplyr::filter(.data$evaluationType == "CV")
+  expect_equal(nrow(cvPrediction), nrow(tinyTrainData$labels))
+  expect_setequal(cvPrediction$rowId, tinyTrainData$labels$rowId)
 })
 
 test_that("test BAR fixed BIC penalty runs", {
