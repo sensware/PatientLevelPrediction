@@ -80,6 +80,16 @@ test_that("BAR tuning matches independent fits and refits all training rows", {
   expectedPenalty <- penalties[order(-colMeans(referenceAuc), -penalties)[1]]
   expect_equal(result$penalty, expectedPenalty)
 
+  # The selected penalty's fold fits are returned for reuse as CV results.
+  bestIndex <- match(expectedPenalty, penalties)
+  expect_length(result$cv, 3)
+  for (foldIndex in 1:3) {
+    holdOut <- fixture$folds$index == foldIndex
+    expect_equal(result$cv[[foldIndex]]$out_sample_auc, referenceAuc[foldIndex, bestIndex])
+    expect_equal(nrow(result$cv[[foldIndex]]$predCV), sum(holdOut))
+    expect_setequal(result$cv[[foldIndex]]$predCV$rowId, fixture$labels$rowId[holdOut])
+  }
+
   independentFullFit <- Cyclops::fitCyclopsModel(
     fixture$newCyclopsData(), prior = result$prior, control = control
   )

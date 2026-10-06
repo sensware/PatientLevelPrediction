@@ -106,6 +106,7 @@ fitCyclopsModel <- function(
   )
   hyperParamSearch <- data.frame()
   cvPrior <- NULL
+  tunedCv <- NULL
 
   isBar <- identical(
     settings$priorfunction,
@@ -178,6 +179,7 @@ fitCyclopsModel <- function(
     fit <- result$modelFit
     hyperParamSearch <- result$hyperParamSearch
     cvPrior <- result$prior
+    tunedCv <- result$cv
     finalBarPenalty <- result$penalty
   } else {
     fit <- tryCatch(
@@ -200,7 +202,8 @@ fitCyclopsModel <- function(
     modelSettings = modelSettings,
     covariateData  = trainData$covariateData,
     control = createCyclopsRefitControl(modelSettings),
-    cvPrior = cvPrior
+    cvPrior = cvPrior,
+    cv = tunedCv
   )
 
   if (!is.null(param$priorCoefs)) {
@@ -262,7 +265,10 @@ fitCyclopsModel <- function(
     # remove the cv from the model:
     modelTrained$cv <- NULL
   }
-  hyperParamSearch <- dplyr::bind_rows(hyperParamSearch, cvPerFold)
+  # Penalty tuning already reports the selected penalty's CV and fold rows.
+  if (nrow(hyperParamSearch) == 0) {
+    hyperParamSearch <- cvPerFold
+  }
 
   finalModelParameters <- list(
     variance = modelTrained$priorVariance,
@@ -442,7 +448,7 @@ predictCyclopsType <- function(coefficients, population, covariateData, modelTyp
 
 createCyclopsModel <- function(fit, modelType, useCrossValidation, cyclopsData, labels, folds,
                                modelSettings, covariateData = NULL, control = NULL,
-                               cvPrior = NULL) {
+                               cvPrior = NULL, cv = NULL) {
   if (is.character(fit)) {
     coefficients <- c(0)
     names(coefficients) <- ""
@@ -494,7 +500,9 @@ createCyclopsModel <- function(fit, modelType, useCrossValidation, cyclopsData, 
   class(outcomeModel) <- "plpModel"
 
   # get CV - added && status == "OK" to only run if the model fit sucsessfully
-  if (modelType == "logistic" && useCrossValidation && status == "OK") {
+  if (modelType == "logistic" && useCrossValidation && status == "OK" && !is.null(cv)) {
+    outcomeModel$cv <- cv
+  } else if (modelType == "logistic" && useCrossValidation && status == "OK") {
     if (is.null(cvPrior)) {
       cvPrior <- createCyclopsCvPrior(
         modelSettings = modelSettings,
@@ -696,54 +704,41 @@ doCyclopsCvPenalty <- function(
 
   ParallelLogger::logInfo("Performing hyperparameter tuning to determine best BAR penalty")
   labels <- merge(trainData$covariateData$labels, trainData$folds, by = "rowId")
-  cvByFold <- lapply(seq_len(max(labels$index)), function(i) {
-    holdOut <- labels$index == i
-    weights <- rep(1.0, Cyclops::getNumberOfRows(cyclopsData))
-    weights[holdOut] <- 0.0
-
-    foldSearch <- vector("list", length(penalties))
-    for (penaltyIndex in seq_along(penalties)) {
-      penalty <- penalties[penaltyIndex]
+  # cvFits[[fold]][[penaltyIndex]] keeps each fold fit so the selected penalty's
+  # out-of-fold predictions can be reused instead of refitting them.
+  cvFits <- lapply(seq_len(max(labels$index)), function(i) {
+    lapply(penalties, function(penalty) {
       candidatePriorParams <- priorParams
       candidatePriorParams$penalty <- penalty
       cvPrior <- do.call(
         BrokenAdaptiveRidge::createBarPrior,
         candidatePriorParams
       )
-
-      subsetFit <- suppressWarnings(Cyclops::fitCyclopsModel(
-        cyclopsData,
+      fitCyclopsCvFold(
+        cyclopsData = cyclopsData,
+        labels = labels,
+        fold = i,
         prior = cvPrior,
         control = control,
-        weights = weights,
+        covariateData = trainData$covariateData,
+        modelType = modelSettings$settings$cyclopsModelType,
         # BAR fixes eliminated coefficients at zero; do not carry that state to another fit.
         forceNewObject = TRUE,
         fixedCoefficients = fixedCoefficients,
         startingCoefficients = startingCoefficients
-      ))
-      coefficients <- stats::coef(subsetFit)
-
-      coefDf <- data.frame(
-        betas = as.numeric(coefficients),
-        covariateIds = names(coefficients),
-        stringsAsFactors = FALSE
       )
-      predAll <- predictCyclopsType(
-        coefficients = coefDf,
-        population = labels,
-        covariateData = trainData$covariateData,
-        modelType = modelSettings$settings$cyclopsModelType
-      )
-      auc <- aucWithoutCi(predAll$rawValue[holdOut], labels$y[holdOut])
-      foldSearch[[penaltyIndex]] <- data.frame(
+    })
+  })
+  cvByFold <- lapply(seq_along(cvFits), function(i) {
+    lapply(seq_along(penalties), function(penaltyIndex) {
+      data.frame(
         metric = "AUC",
         fold = paste0("Fold", i),
-        value = auc,
-        penalty = penalty,
+        value = cvFits[[i]][[penaltyIndex]]$out_sample_auc,
+        penalty = penalties[penaltyIndex],
         stringsAsFactors = FALSE
       )
-    }
-    foldSearch
+    })
   })
   hyperParamSearch <- dplyr::bind_rows(unlist(cvByFold, recursive = FALSE))
   cvMeans <- hyperParamSearch %>%
@@ -767,6 +762,8 @@ doCyclopsCvPenalty <- function(
     dplyr::arrange(dplyr::desc(.data$value), dplyr::desc(.data$penalty)) %>%
     dplyr::slice(1)
   bestPenalty <- bestRow$penalty
+  bestIndex <- match(bestPenalty, penalties)
+  cv <- lapply(cvFits, function(foldFits) foldFits[[bestIndex]])
   ParallelLogger::logInfo(paste0("Best BAR penalty: ", signif(bestPenalty, 4)))
 
   priorParams$penalty <- bestPenalty
@@ -795,7 +792,8 @@ doCyclopsCvPenalty <- function(
     modelFit = modelFit,
     prior = prior,
     penalty = bestPenalty,
-    hyperParamSearch = hyperParamSearch
+    hyperParamSearch = hyperParamSearch,
+    cv = cv
   )
 }
 
@@ -824,53 +822,78 @@ getCV <- function(
   labels <- merge(labels, folds, by = "rowId")
 
   result <- lapply(1:max(labels$index), function(i) {
-    hold_out <- labels$index == i
-    weights <- rep(1.0, Cyclops::getNumberOfRows(cyclopsData))
-    weights[hold_out] <- 0.0
-    subset_fit <- suppressWarnings(Cyclops::fitCyclopsModel(cyclopsData,
+    fitCyclopsCvFold(
+      cyclopsData = cyclopsData,
+      labels = labels,
+      fold = i,
       prior = cvPrior,
-      weights = weights,
       control = control,
+      covariateData = covariateData,
+      modelType = modelType,
       forceNewObject = forceNewObject
-    ))
-    coefficients <- stats::coef(subset_fit)
-    coefDf <- data.frame(
-      betas = as.numeric(coefficients),
-      covariateIds = names(coefficients),
-      stringsAsFactors = FALSE
     )
-    if (!is.null(covariateData)) {
-      predAll <- predictCyclopsType(
-        coefficients = coefDf,
-        population = labels,
-        covariateData = covariateData,
-        modelType = modelType
-      )
-      probsAll <- predAll$value
-      rawValueAll <- predAll$rawValue
-    } else {
-      probsAll <- stats::predict(subset_fit)
-      probsAllClipped <- pmin(pmax(probsAll, 1e-15), 1 - 1e-15)
-      rawValueAll <- stats::qlogis(probsAllClipped)
-    }
-
-    auc <- aucWithoutCi(rawValueAll[hold_out], labels$y[hold_out])
-
-    predCV <- cbind(
-      labels[hold_out, ],
-      value = probsAll[hold_out],
-      rawValue = rawValueAll[hold_out]
-    )
-    return(list(
-      out_sample_auc = auc,
-      predCV = predCV,
-      log_likelihood = subset_fit$log_likelihood,
-      log_prior = subset_fit$log_prior,
-      coef = stats::coef(subset_fit)
-    ))
   })
 
   return(result)
+}
+
+fitCyclopsCvFold <- function(
+    cyclopsData,
+    labels,
+    fold,
+    prior,
+    control = NULL,
+    covariateData = NULL,
+    modelType = "logistic",
+    forceNewObject = FALSE,
+    fixedCoefficients = NULL,
+    startingCoefficients = NULL) {
+  hold_out <- labels$index == fold
+  weights <- rep(1.0, Cyclops::getNumberOfRows(cyclopsData))
+  weights[hold_out] <- 0.0
+  subset_fit <- suppressWarnings(Cyclops::fitCyclopsModel(cyclopsData,
+    prior = prior,
+    weights = weights,
+    control = control,
+    forceNewObject = forceNewObject,
+    fixedCoefficients = fixedCoefficients,
+    startingCoefficients = startingCoefficients
+  ))
+  coefficients <- stats::coef(subset_fit)
+  coefDf <- data.frame(
+    betas = as.numeric(coefficients),
+    covariateIds = names(coefficients),
+    stringsAsFactors = FALSE
+  )
+  if (!is.null(covariateData)) {
+    predAll <- predictCyclopsType(
+      coefficients = coefDf,
+      population = labels,
+      covariateData = covariateData,
+      modelType = modelType
+    )
+    probsAll <- predAll$value
+    rawValueAll <- predAll$rawValue
+  } else {
+    probsAll <- stats::predict(subset_fit)
+    probsAllClipped <- pmin(pmax(probsAll, 1e-15), 1 - 1e-15)
+    rawValueAll <- stats::qlogis(probsAllClipped)
+  }
+
+  auc <- aucWithoutCi(rawValueAll[hold_out], labels$y[hold_out])
+
+  predCV <- cbind(
+    labels[hold_out, ],
+    value = probsAll[hold_out],
+    rawValue = rawValueAll[hold_out]
+  )
+  list(
+    out_sample_auc = auc,
+    predCV = predCV,
+    log_likelihood = subset_fit$log_likelihood,
+    log_prior = subset_fit$log_prior,
+    coef = coefficients
+  )
 }
 
 getVariableImportance <- function(modelTrained, trainData) {
